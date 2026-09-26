@@ -63,9 +63,10 @@ and compressed, so they have to be extracted first.
 
 ## Testing
 
-**Only the Java layer has tests.** `NetworkUtilsTest` (JUnit 5, run by surefire
-in `mvn verify` and in CI) covers `NetworkUtils`: host validation and the
-input checks that return before any process starts. There is no MUnit, so the
+**Only the Java layer has tests.** `NetworkUtilsTest` (JUnit 5) covers
+`NetworkUtils`: host validation, the input checks that return before any
+process starts, and a loopback socket probe. Surefire runs it in every build
+that reaches the test phase, including `mvn package` in the release workflow. There is no MUnit, so the
 flows, the RAML validation and the commands themselves are not tested. Do not
 claim a flow change is verified because the build passed.
 

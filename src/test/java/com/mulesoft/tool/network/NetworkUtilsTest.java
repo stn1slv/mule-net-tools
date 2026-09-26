@@ -56,6 +56,14 @@ class NetworkUtilsTest {
 	}
 
 	@Test
+	void hostPortBracketsIpv6ForOpenssl() {
+		assertEquals("example.com:443", NetworkUtils.hostPort("example.com", "443"));
+		assertEquals("10.0.0.1:443", NetworkUtils.hostPort("10.0.0.1", "443"));
+		assertEquals("[::1]:443", NetworkUtils.hostPort("::1", "443"));
+		assertEquals("[2001:db8::1]:8443", NetworkUtils.hostPort("2001:db8::1", "8443"));
+	}
+
+	@Test
 	void resolveIPsAcceptsNullDnsServer() throws Exception {
 		assertEquals("127.0.0.1", NetworkUtils.resolveIPs("127.0.0.1", null));
 	}

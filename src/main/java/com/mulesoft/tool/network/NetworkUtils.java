@@ -39,6 +39,8 @@ public class NetworkUtils {
 	// because ping, dig and traceroute would read such a value as an option (dig treats
 	// '+' as a query option, and -f makes it read a local file). None of them reliably
 	// accept '--' as an end-of-options marker, so the value is validated instead.
+	// Keep in sync with the Host and DnsServer types in net-tools.raml, which apply the
+	// same rule at the API boundary.
 	private static final Pattern HOST_PATTERN = Pattern.compile("^[A-Za-z0-9:][A-Za-z0-9._:-]{0,252}$");
 
 	// Upper bound for any single command. openssl s_client against a host that drops
@@ -49,6 +51,20 @@ public class NetworkUtils {
 	// or empty output is not mistaken for a complete result.
 	private static final String TIMEOUT_NOTICE =
 			"\n[Command stopped after " + PROCESS_TIMEOUT_SECONDS + " seconds; the output above may be incomplete.]\n";
+
+	// Upper bound for a whole cipherTest call. The per-process timeout alone does not
+	// bound it: a host that answers each probe slowly, but within the timeout, would
+	// still cost that much for every one of several hundred ciphers.
+	private static final long CIPHER_TEST_BUDGET_SECONDS = 300;
+
+	private record Result(String output, boolean timedOut) {
+	}
+
+	// openssl reads an IPv6 address as host and port only when it is in brackets:
+	// "::1:443" is ambiguous, "[::1]:443" is not.
+	static String hostPort(String host, String port) {
+		return host.indexOf(':') >= 0 ? "[" + host + "]:" + port : host + ":" + port;
+	}
 
 	static boolean isValidHost(String host) {
 		return host != null && HOST_PATTERN.matcher(host).matches();
@@ -363,7 +379,7 @@ public class NetworkUtils {
 		if (!isValidHost(host)) {
 			return invalidHost(host);
 		}
-		return execute(new ProcessBuilder("openssl", "s_client", "-showcerts", "-servername", host, "-connect", host+":"+port));
+		return execute(new ProcessBuilder("openssl", "s_client", "-showcerts", "-servername", host, "-connect", hostPort(host, port)));
 	}
 
 	public static String cipherTest(String host, String port) throws Exception {
@@ -371,11 +387,23 @@ public class NetworkUtils {
 			return invalidHost(host);
 		}
 		String remoteEndpointSupportedCiphers = "List of supported ciphers:\n\n";
-		String[] openSslAvailableCiphers = execute(new ProcessBuilder("openssl","ciphers","ALL:!eNULL")).split(":");
+		Result cipherList = run(new ProcessBuilder("openssl","ciphers","ALL:!eNULL"), NEWLINE);
+		if (cipherList.timedOut()) {
+			return "Could not list the available ciphers: openssl did not answer within "
+					+ PROCESS_TIMEOUT_SECONDS + " seconds.";
+		}
+		// trim() drops the trailing newline, which would otherwise end up in the last cipher name.
+		String[] openSslAvailableCiphers = cipherList.output().trim().split(":");
 
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(CIPHER_TEST_BUDGET_SECONDS);
 		for (String cipher : openSslAvailableCiphers) {
-			String output = execute(new ProcessBuilder("openssl", "s_client", "-cipher", cipher, "-servername", host, "-connect", host+":"+port));
-			if (output.contains(TIMEOUT_NOTICE)) {
+			if (System.nanoTime() > deadline) {
+				return remoteEndpointSupportedCiphers + "\nStopped: the test exceeded its " + CIPHER_TEST_BUDGET_SECONDS
+						+ " second budget, so the remaining ciphers were not tested.\n";
+			}
+			Result probe = run(new ProcessBuilder("openssl", "s_client", "-cipher", cipher, "-servername", host, "-connect", hostPort(host, port)), NEWLINE);
+			String output = probe.output();
+			if (probe.timedOut()) {
 				// The timeout bounds each probe, not the call. A host that drops packets would
 				// otherwise cost a full timeout for every one of several hundred ciphers.
 				return remoteEndpointSupportedCiphers + "\nStopped: the connection to " + host + ":" + port
@@ -395,6 +423,11 @@ public class NetworkUtils {
 	}
 
 	private static String execute(ProcessBuilder pb, byte[] stdinData) throws IOException {
+		Result result = run(pb, stdinData);
+		return result.timedOut() ? result.output() + TIMEOUT_NOTICE : result.output();
+	}
+
+	private static Result run(ProcessBuilder pb, byte[] stdinData) throws IOException {
 		// Merge stderr into stdout at the OS level. Reading them as two separate streams
 		// deadlocks whenever a command fills the stderr pipe while we are still draining
 		// stdout, and no amount of quietening individual commands removes that class.
@@ -405,8 +438,15 @@ public class NetworkUtils {
 		AtomicBoolean timedOut = new AtomicBoolean();
 		p.onExit().orTimeout(PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
 				.exceptionally(t -> {
-					timedOut.set(true);
-					return p.destroyForcibly();
+					// A process that exited right at the limit completed normally.
+					if (p.isAlive()) {
+						timedOut.set(true);
+						// Children first: once the parent is gone they can no longer be found,
+						// and one that inherited the output pipe would keep the read blocked.
+						p.descendants().forEach(ProcessHandle::destroyForcibly);
+						p.destroyForcibly();
+					}
+					return p;
 				});
 		try {
 			// Raw bytes, not a Writer. Anything the caller sends is relayed exactly as it
@@ -423,8 +463,7 @@ public class NetworkUtils {
 			// worker with no LANG set can be US-ASCII and would mangle non-ASCII responses.
 			try (java.util.Scanner s = new java.util.Scanner(p.getInputStream(), StandardCharsets.UTF_8)
 					.useDelimiter("\\A")) {
-				String output = s.hasNext() ? s.next() : "";
-				return timedOut.get() ? output + TIMEOUT_NOTICE : output;
+				return new Result(s.hasNext() ? s.next() : "", timedOut.get());
 			}
 		} finally {
 			// Reap the child. Without this the worker accumulates defunct processes and
