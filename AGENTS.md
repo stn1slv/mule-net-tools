@@ -63,9 +63,12 @@ and compressed, so they have to be extracted first.
 
 ## Testing
 
-**There is no test infrastructure.** No JUnit, no MUnit, no test sources. Do not
-claim a change is verified because the build passed; the build only proves it
-compiles and the XML parses.
+**Only the Java layer has tests.** `NetworkUtilsTest` (JUnit 5) covers
+`NetworkUtils`: host validation, the input checks that return before any
+process starts, and a loopback socket probe. Surefire runs it in every build
+that reaches the test phase, including `mvn package` in the release workflow. There is no MUnit, so the
+flows, the RAML validation and the commands themselves are not tested. Do not
+claim a flow change is verified because the build passed.
 
 There is also no Mule runtime available in most development environments here,
 so flows cannot be exercised locally. Two things you *can* do:

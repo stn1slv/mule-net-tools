@@ -1,8 +1,6 @@
 package com.mulesoft.tool.network;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.PrintStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -12,6 +10,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
@@ -34,12 +35,57 @@ public class NetworkUtils {
 	private static final List<String> ALLOWED_AUTH_TYPES =
 			Arrays.asList("BASIC", "BEARER");
 
+	// A host name or an IPv4/IPv6 address. The first character may not be '-' or '+',
+	// because ping, dig and traceroute would read such a value as an option (dig treats
+	// '+' as a query option, and -f makes it read a local file). None of them reliably
+	// accept '--' as an end-of-options marker, so the value is validated instead.
+	// Keep in sync with the Host and DnsServer types in net-tools.raml, which apply the
+	// same rule at the API boundary.
+	private static final Pattern HOST_PATTERN = Pattern.compile("^[A-Za-z0-9:][A-Za-z0-9._:-]{0,252}$");
+
+	// Upper bound for any single command. openssl s_client against a host that drops
+	// packets otherwise waits for the operating system TCP timeout, holding a worker thread.
+	private static final long PROCESS_TIMEOUT_SECONDS = 60;
+
+	// Appended to the output of a command that was killed by the timeout, so partial
+	// or empty output is not mistaken for a complete result.
+	private static final String TIMEOUT_NOTICE =
+			"\n[Command stopped after " + PROCESS_TIMEOUT_SECONDS + " seconds; the output above may be incomplete.]\n";
+
+	// Upper bound for a whole cipherTest call. The per-process timeout alone does not
+	// bound it: a host that answers each probe slowly, but within the timeout, would
+	// still cost that much for every one of several hundred ciphers.
+	private static final long CIPHER_TEST_BUDGET_SECONDS = 300;
+
+	private record Result(String output, boolean timedOut) {
+	}
+
+	// openssl reads an IPv6 address as host and port only when it is in brackets:
+	// "::1:443" is ambiguous, "[::1]:443" is not.
+	static String hostPort(String host, String port) {
+		return host.indexOf(':') >= 0 ? "[" + host + "]:" + port : host + ":" + port;
+	}
+
+	static boolean isValidHost(String host) {
+		return host != null && HOST_PATTERN.matcher(host).matches();
+	}
+
+	private static String invalidHost(String host) {
+		return "Invalid host: " + host + ". Use a host name or an IP address.";
+	}
+
 	public static String ping(String host) throws Exception {
+		if (!isValidHost(host)) {
+			return invalidHost(host);
+		}
 		return execute(new ProcessBuilder("ping", "-c", "4", host));
 	}
 
 	public static String resolveIPs(String host, String dnsServer) throws UnknownHostException {
-		if (dnsServer.equals("default") || dnsServer == null || dnsServer.isEmpty())
+		if (!isValidHost(host)) {
+			return invalidHost(host);
+		}
+		if (dnsServer == null || dnsServer.isEmpty() || dnsServer.equals("default"))
  		{
 			InetAddress[] addresses = InetAddress.getAllByName(host);
 			StringBuilder sb = new StringBuilder();
@@ -52,9 +98,14 @@ public class NetworkUtils {
 			return sb.toString();
 		}	
 		else {
- 			dnsServer = "@" + dnsServer;
+ 			if (!isValidHost(dnsServer)) {
+				return "Invalid DNS server: " + dnsServer + ". Use a host name or an IP address.";
+			}
+			dnsServer = "@" + dnsServer;
 			try {
-				return execute(new ProcessBuilder("dig", "+short", dnsServer, host));
+				// -q marks the value as the query name. Without it dig reads a host such as
+				// AXFR or ANY as a query type rather than a name.
+				return execute(new ProcessBuilder("dig", "+short", dnsServer, "-q", host));
 			} catch (IOException e) {
 				return e.getMessage();
 			} 
@@ -282,12 +333,14 @@ public class NetworkUtils {
 	}
 
 	public static String testConnect(String host, String port) {
+		if (!isValidHost(host)) {
+			return invalidHost(host);
+		}
 		long startTime = System.nanoTime();
 		long totalTime = System.nanoTime();
 		String result = "";
 		for (int x = 1; x <= 5; x++) {
-			try {
-				Socket socket = new Socket();
+			try (Socket socket = new Socket()) {
 				startTime = System.nanoTime();
 				socket.connect(new InetSocketAddress(host, Integer.parseInt(port)), 10000);
 				socket.setSoTimeout(10000);
@@ -295,7 +348,6 @@ public class NetworkUtils {
 					totalTime = System.nanoTime() - startTime;
 					socket.getInputStream();
 				}
-				socket.close();
 			} 
 			catch (java.net.UnknownHostException e) {
 				return "Could not resolve host " + host;
@@ -306,10 +358,10 @@ public class NetworkUtils {
 			catch (java.lang.IllegalArgumentException e) {
 				return e.getMessage();
 			}
-			catch (Exception e) {
-				ByteArrayOutputStream b = new ByteArrayOutputStream();
-				e.printStackTrace(new PrintStream(b));
-				return b.toString();
+			catch (IOException e) {
+				// The message is enough to diagnose a refused or unreachable port. A stack
+				// trace would only expose the application's internals to the caller.
+				return "Could not connect to " + host + ":" + port + ": " + e.getMessage();
 			}
 			result = result + "Probe " + x + ": Connection successful, RTT=" + Long.toString(totalTime/1000000) + "ms\n";
 		}
@@ -317,19 +369,47 @@ public class NetworkUtils {
 	}
 
 	public static String traceRoute(String host) throws Exception {
+		if (!isValidHost(host)) {
+			return invalidHost(host);
+		}
 		return execute(new ProcessBuilder("traceroute", "-w", "3", "-q", "1", "-m", "18", "-n", host));
 	}
 
 	public static String certest(String host, String port) throws Exception {
-		return execute(new ProcessBuilder("openssl", "s_client", "-showcerts", "-servername", host, "-connect", host+":"+port));
+		if (!isValidHost(host)) {
+			return invalidHost(host);
+		}
+		return execute(new ProcessBuilder("openssl", "s_client", "-showcerts", "-servername", host, "-connect", hostPort(host, port)));
 	}
 
 	public static String cipherTest(String host, String port) throws Exception {
+		if (!isValidHost(host)) {
+			return invalidHost(host);
+		}
 		String remoteEndpointSupportedCiphers = "List of supported ciphers:\n\n";
-		String[] openSslAvailableCiphers = execute(new ProcessBuilder("openssl","ciphers","ALL:!eNULL")).split(":");
+		Result cipherList = run(new ProcessBuilder("openssl","ciphers","ALL:!eNULL"), NEWLINE);
+		if (cipherList.timedOut()) {
+			return "Could not list the available ciphers: openssl did not answer within "
+					+ PROCESS_TIMEOUT_SECONDS + " seconds.";
+		}
+		// trim() drops the trailing newline, which would otherwise end up in the last cipher name.
+		String[] openSslAvailableCiphers = cipherList.output().trim().split(":");
 
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(CIPHER_TEST_BUDGET_SECONDS);
 		for (String cipher : openSslAvailableCiphers) {
-			if (execute(new ProcessBuilder("openssl", "s_client", "-cipher", cipher, "-servername", host, "-connect", host+":"+port)).contains("BEGIN CERTIFICATE")) {
+			if (System.nanoTime() > deadline) {
+				return remoteEndpointSupportedCiphers + "\nStopped: the test exceeded its " + CIPHER_TEST_BUDGET_SECONDS
+						+ " second budget, so the remaining ciphers were not tested.\n";
+			}
+			Result probe = run(new ProcessBuilder("openssl", "s_client", "-cipher", cipher, "-servername", host, "-connect", hostPort(host, port)), NEWLINE);
+			String output = probe.output();
+			if (probe.timedOut()) {
+				// The timeout bounds each probe, not the call. A host that drops packets would
+				// otherwise cost a full timeout for every one of several hundred ciphers.
+				return remoteEndpointSupportedCiphers + "\nStopped: the connection to " + host + ":" + port
+						+ " timed out, so the remaining ciphers were not tested.\n";
+			}
+			if (output.contains("BEGIN CERTIFICATE")) {
 				remoteEndpointSupportedCiphers = remoteEndpointSupportedCiphers + cipher + ": YES\n";
 			} else {
 				remoteEndpointSupportedCiphers = remoteEndpointSupportedCiphers + cipher + ": NO\n";
@@ -343,11 +423,31 @@ public class NetworkUtils {
 	}
 
 	private static String execute(ProcessBuilder pb, byte[] stdinData) throws IOException {
+		Result result = run(pb, stdinData);
+		return result.timedOut() ? result.output() + TIMEOUT_NOTICE : result.output();
+	}
+
+	private static Result run(ProcessBuilder pb, byte[] stdinData) throws IOException {
 		// Merge stderr into stdout at the OS level. Reading them as two separate streams
 		// deadlocks whenever a command fills the stderr pipe while we are still draining
 		// stdout, and no amount of quietening individual commands removes that class.
 		pb.redirectErrorStream(true);
 		Process p = pb.start();
+		// Killing the process closes its output pipe, which ends the blocking read below.
+		// On a normal exit the timeout is cancelled and nothing happens.
+		AtomicBoolean timedOut = new AtomicBoolean();
+		p.onExit().orTimeout(PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+				.exceptionally(t -> {
+					// A process that exited right at the limit completed normally.
+					if (p.isAlive()) {
+						timedOut.set(true);
+						// Children first: once the parent is gone they can no longer be found,
+						// and one that inherited the output pipe would keep the read blocked.
+						p.descendants().forEach(ProcessHandle::destroyForcibly);
+						p.destroyForcibly();
+					}
+					return p;
+				});
 		try {
 			// Raw bytes, not a Writer. Anything the caller sends is relayed exactly as it
 			// arrived, so a payload in another charset, or one that is not text at all,
@@ -363,7 +463,7 @@ public class NetworkUtils {
 			// worker with no LANG set can be US-ASCII and would mangle non-ASCII responses.
 			try (java.util.Scanner s = new java.util.Scanner(p.getInputStream(), StandardCharsets.UTF_8)
 					.useDelimiter("\\A")) {
-				return s.hasNext() ? s.next() : "";
+				return new Result(s.hasNext() ? s.next() : "", timedOut.get());
 			}
 		} finally {
 			// Reap the child. Without this the worker accumulates defunct processes and
