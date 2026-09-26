@@ -13,6 +13,12 @@ types:
       command-line tools behind these endpoints would read it as an option.
     type: string
     pattern: ^[A-Za-z0-9:][A-Za-z0-9._:-]{0,252}$
+  DnsServer:
+    description: |
+      Like Host, but may also be empty, which means the default resolver, as when
+      the parameter is omitted.
+    type: string
+    pattern: ^$|^[A-Za-z0-9:][A-Za-z0-9._:-]{0,252}$
 
 traits:
   curlParams:
@@ -112,7 +118,7 @@ traits:
         type: Host
       dnsServer:
         description: The DNS server to use for resolution.        
-        type: Host
+        type: DnsServer
         required: false
     responses: 
       200:

@@ -11,6 +11,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
@@ -43,6 +44,11 @@ public class NetworkUtils {
 	// Upper bound for any single command. openssl s_client against a host that drops
 	// packets otherwise waits for the operating system TCP timeout, holding a worker thread.
 	private static final long PROCESS_TIMEOUT_SECONDS = 60;
+
+	// Appended to the output of a command that was killed by the timeout, so partial
+	// or empty output is not mistaken for a complete result.
+	private static final String TIMEOUT_NOTICE =
+			"\n[Command stopped after " + PROCESS_TIMEOUT_SECONDS + " seconds; the output above may be incomplete.]\n";
 
 	static boolean isValidHost(String host) {
 		return host != null && HOST_PATTERN.matcher(host).matches();
@@ -81,7 +87,9 @@ public class NetworkUtils {
 			}
 			dnsServer = "@" + dnsServer;
 			try {
-				return execute(new ProcessBuilder("dig", "+short", dnsServer, host));
+				// -q marks the value as the query name. Without it dig reads a host such as
+				// AXFR or ANY as a query type rather than a name.
+				return execute(new ProcessBuilder("dig", "+short", dnsServer, "-q", host));
 			} catch (IOException e) {
 				return e.getMessage();
 			} 
@@ -309,6 +317,9 @@ public class NetworkUtils {
 	}
 
 	public static String testConnect(String host, String port) {
+		if (!isValidHost(host)) {
+			return invalidHost(host);
+		}
 		long startTime = System.nanoTime();
 		long totalTime = System.nanoTime();
 		String result = "";
@@ -349,15 +360,28 @@ public class NetworkUtils {
 	}
 
 	public static String certest(String host, String port) throws Exception {
+		if (!isValidHost(host)) {
+			return invalidHost(host);
+		}
 		return execute(new ProcessBuilder("openssl", "s_client", "-showcerts", "-servername", host, "-connect", host+":"+port));
 	}
 
 	public static String cipherTest(String host, String port) throws Exception {
+		if (!isValidHost(host)) {
+			return invalidHost(host);
+		}
 		String remoteEndpointSupportedCiphers = "List of supported ciphers:\n\n";
 		String[] openSslAvailableCiphers = execute(new ProcessBuilder("openssl","ciphers","ALL:!eNULL")).split(":");
 
 		for (String cipher : openSslAvailableCiphers) {
-			if (execute(new ProcessBuilder("openssl", "s_client", "-cipher", cipher, "-servername", host, "-connect", host+":"+port)).contains("BEGIN CERTIFICATE")) {
+			String output = execute(new ProcessBuilder("openssl", "s_client", "-cipher", cipher, "-servername", host, "-connect", host+":"+port));
+			if (output.contains(TIMEOUT_NOTICE)) {
+				// The timeout bounds each probe, not the call. A host that drops packets would
+				// otherwise cost a full timeout for every one of several hundred ciphers.
+				return remoteEndpointSupportedCiphers + "\nStopped: the connection to " + host + ":" + port
+						+ " timed out, so the remaining ciphers were not tested.\n";
+			}
+			if (output.contains("BEGIN CERTIFICATE")) {
 				remoteEndpointSupportedCiphers = remoteEndpointSupportedCiphers + cipher + ": YES\n";
 			} else {
 				remoteEndpointSupportedCiphers = remoteEndpointSupportedCiphers + cipher + ": NO\n";
@@ -378,8 +402,12 @@ public class NetworkUtils {
 		Process p = pb.start();
 		// Killing the process closes its output pipe, which ends the blocking read below.
 		// On a normal exit the timeout is cancelled and nothing happens.
+		AtomicBoolean timedOut = new AtomicBoolean();
 		p.onExit().orTimeout(PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-				.exceptionally(t -> p.destroyForcibly());
+				.exceptionally(t -> {
+					timedOut.set(true);
+					return p.destroyForcibly();
+				});
 		try {
 			// Raw bytes, not a Writer. Anything the caller sends is relayed exactly as it
 			// arrived, so a payload in another charset, or one that is not text at all,
@@ -395,7 +423,8 @@ public class NetworkUtils {
 			// worker with no LANG set can be US-ASCII and would mangle non-ASCII responses.
 			try (java.util.Scanner s = new java.util.Scanner(p.getInputStream(), StandardCharsets.UTF_8)
 					.useDelimiter("\\A")) {
-				return s.hasNext() ? s.next() : "";
+				String output = s.hasNext() ? s.next() : "";
+				return timedOut.get() ? output + TIMEOUT_NOTICE : output;
 			}
 		} finally {
 			// Reap the child. Without this the worker accumulates defunct processes and

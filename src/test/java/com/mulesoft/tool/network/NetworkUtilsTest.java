@@ -49,6 +49,13 @@ class NetworkUtilsTest {
 	}
 
 	@Test
+	void socketAndTlsTestsRejectOptionLikeHost() throws Exception {
+		assertTrue(NetworkUtils.testConnect("-x", "443").startsWith("Invalid host"));
+		assertTrue(NetworkUtils.certest("-x", "443").startsWith("Invalid host"));
+		assertTrue(NetworkUtils.cipherTest("-x", "443").startsWith("Invalid host"));
+	}
+
+	@Test
 	void resolveIPsAcceptsNullDnsServer() throws Exception {
 		assertEquals("127.0.0.1", NetworkUtils.resolveIPs("127.0.0.1", null));
 	}
