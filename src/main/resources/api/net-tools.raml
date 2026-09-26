@@ -6,6 +6,14 @@ securitySchemes:
   basic:
     type: Basic Authentication
 
+types:
+  Host:
+    description: |
+      A host name or an IP address. It may not start with '-' or '+', because the
+      command-line tools behind these endpoints would read it as an option.
+    type: string
+    pattern: ^[A-Za-z0-9:][A-Za-z0-9._:-]{0,252}$
+
 traits:
   curlParams:
     headers:
@@ -40,7 +48,7 @@ traits:
     queryParameters:
       host:
         description: The domain or ip of the host to ping
-        type: string
+        type: Host
     responses: 
       200:
         body: 
@@ -62,7 +70,7 @@ traits:
     queryParameters:
       host:
         description: The domain or ip of the host to be tested
-        type: string
+        type: Host
       port:
         description: The port number of host to be tested
         type: number
@@ -78,7 +86,7 @@ traits:
     queryParameters:
       host:
         description: The domain or ip of the host to traceroute
-        type: string
+        type: Host
     responses: 
       200:
         body: 
@@ -101,10 +109,10 @@ traits:
     queryParameters:
       host:
         description: The the fully qualified domain name the host to test
-        type: string
+        type: Host
       dnsServer:
         description: The DNS server to use for resolution.        
-        type: string
+        type: Host
         required: false
     responses: 
       200:
@@ -179,7 +187,7 @@ traits:
     queryParameters:
       host:
         description: The domain or ip of the host to connect to
-        type: string
+        type: Host
       port:
         description: The port number of host to be tested
         type: number        
@@ -195,7 +203,7 @@ traits:
     queryParameters:
       host:
         description: The domain or ip of the host to connect to
-        type: string
+        type: Host
       port:
         description: The port number of host to be tested
         type: number
